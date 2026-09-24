@@ -1,0 +1,5 @@
+Professional Networking App
+
+The system allows people to create professional profiles and connect with other professionals. Users can share posts on a news feed, exchange private messages, and apply for jobs. The platform also supports user registration and profile management.
+
+Key features include user registration and profile management, connecting with other users, news feed with posts, messaging, and job posting and applying.
