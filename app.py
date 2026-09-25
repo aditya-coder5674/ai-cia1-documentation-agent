@@ -1,4 +1,4 @@
-"""DocuMind AI — iterative documentation workbench."""
+"""DocuMind AI: generate and improve software documentation from user input or uploaded notes."""
 from __future__ import annotations
 
 import json
@@ -12,530 +12,179 @@ import streamlit as st
 from knowledge_base import format_context, load_text_files, retrieve
 from llm_client import ask_gemini
 
-SAMPLE_PROJECT = {
-    "name": "Professional Networking App",
-    "idea": "A web app where professionals build profiles, connect, share posts, message each other and apply for jobs.",
-    "features": [
-        "User registration and profile",
-        "Connect with other users",
-        "News feed with posts",
-        "Messaging",
-        "Job posting and applying",
-    ],
-}
-
-SAMPLE_DOC_TEXT = """# Project overview
-
-This project allows professionals to create profiles, connect with other users, post updates, message each other, and apply for jobs.
-
-## Goals
-- Make networking easy for professionals
-- Support trusted user profiles and messaging
-- Help job seekers connect with employers
-
-## Constraints
-- Must work as a web application
-- Must be easy to use on desktop and mobile
-- Must support secure authentication
-"""
-
 
 def slugify(value: str) -> str:
-    value = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
-    return value or "document"
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "document"
 
 
-def ensure_workspace() -> Path:
+def save_version(name: str, kind: str, value: dict | str) -> None:
     workspace = Path("workspace")
     workspace.mkdir(exist_ok=True)
-    return workspace
+    versions = st.session_state.setdefault("versions", [])
+    path = workspace / f"{slugify(name)}-v{len(versions) + 1}.json"
+    path.write_text(json.dumps(value, indent=2) if isinstance(value, dict) else value, encoding="utf-8")
+    versions.append({"type": kind, "path": str(path), "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")})
 
 
-def ensure_session_state() -> None:
-    if "versions" not in st.session_state:
-        st.session_state.versions = []
-    if "current_document" not in st.session_state:
-        st.session_state.current_document = None
-    if "quality_report" not in st.session_state:
-        st.session_state.quality_report = None
+def features_from_text(text: str) -> list[str]:
+    """Extract useful feature candidates from headings and bullet points."""
+    found = []
+    for line in text.splitlines():
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        line = re.sub(r"^#+\s*", "", line).strip()
+        if 2 < len(line) < 100 and line and not line.endswith(('.', ':')):
+            if line.lower() not in {x.lower() for x in found}:
+                found.append(line)
+    return found[:20]
 
 
-def save_version(name: str, document_type: str, payload: dict | str) -> None:
-    workspace = ensure_workspace()
-    versions = st.session_state.versions
-    label = f"{slugify(name)}-v{len(versions) + 1}"
-    if isinstance(payload, dict):
-        content = json.dumps(payload, indent=2)
+def offline_document(project: dict, kind: str, source: str) -> dict | str:
+    features = project["features"] or features_from_text(source)
+    name = project["name"] or "Untitled project"
+    idea = project["idea"] or source[:500] or "A software project."
+    if kind == "Improved text":
+        lines = [x.strip() for x in source.splitlines() if x.strip()]
+        return "# Improved document\n\n## Overview\n" + ("\n\n".join(f"- {x}" for x in lines) if lines else "No source text was provided.") + "\n\n## Acceptance criteria\n- Requirements are clear, observable, and testable."
+    if kind == "SRS":
+        requirements, tests = [], []
+        for i, feature in enumerate(features, 1):
+            rid = f"REQ-{i:02d}"
+            requirements.append({"id": rid, "feature": feature, "text": f"The system shall support {feature.lower()}."})
+            tests += [
+                {"id": f"TC-{i * 2 - 1:02d}", "requirement_id": rid, "type": "positive", "description": f"Valid {feature.lower()} succeeds."},
+                {"id": f"TC-{i * 2:02d}", "requirement_id": rid, "type": "negative", "description": f"Invalid {feature.lower()} is rejected gracefully."},
+            ]
+        return {"document_type": "SRS", "project": name, "summary": idea, "requirements": requirements, "test_cases": tests}
+    if kind == "PRD":
+        return {"document_type": "PRD", "project": name, "goal": idea, "requirements": [{"id": f"PRD-{i:02d}", "requirement": f"The system shall support {f.lower()}"} for i, f in enumerate(features, 1)], "success_metrics": ["Users can complete the main task", "The product is easy to understand"]}
+    return {"document_type": "User stories", "project": name, "stories": [{"id": f"US-{i:02d}", "as_a": "User", "i_want": f.lower(), "so_that": "I can achieve my goal", "acceptance_criteria": [f"The {f.lower()} flow is available.", "Invalid input is handled clearly."]} for i, f in enumerate(features, 1)]}
+
+
+def quality(document: dict | str) -> dict:
+    if isinstance(document, str):
+        score = 75 if len(document.split()) >= 40 else 55
+        issues = [] if score == 75 else ["The document is short and may lack detail."]
+    elif document.get("document_type") == "SRS":
+        reqs, tests = document.get("requirements", []), document.get("test_cases", [])
+        complete = sum({t.get("type") for t in tests if t.get("requirement_id") == r.get("id")} >= {"positive", "negative"} for r in reqs)
+        score = round(complete / len(reqs) * 100, 1) if reqs else 0
+        issues = [] if score == 100 else ["Some requirements do not have both positive and negative tests."]
     else:
-        content = payload
-    version_path = workspace / f"{label}.json"
-    version_path.write_text(content, encoding="utf-8")
-    versions.append(
-        {
-            "name": label,
-            "type": document_type,
-            "saved_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "path": str(version_path),
-        }
-    )
-    st.session_state.versions = versions
-
-
-def create_diff(before: str, after: str) -> str:
-    if before == after:
-        return "No textual changes detected."
-    before_lines = before.splitlines()
-    after_lines = after.splitlines()
-    diff_lines: list[str] = []
-    sentinel = set(before_lines) | set(after_lines)
-    for line in sorted(sentinel, key=lambda s: (s not in before_lines, s not in after_lines, s)):
-        if line in after_lines and line not in before_lines:
-            diff_lines.append(f"+ {line}")
-        elif line in before_lines and line not in after_lines:
-            diff_lines.append(f"- {line}")
-    return "\n".join(diff_lines[:30]) or "Changes detected but line-level diff is minimal."
-
-
-def generate_quality_report(project: dict, document: dict | str, document_type: str) -> dict:
-    issues: list[str] = []
-    score = 80.0
-    features = project.get("features") or []
-
-    if isinstance(document, dict):
-        if document_type == "SRS":
-            requirements = document.get("requirements", [])
-            tests = document.get("test_cases", [])
-            if not features:
-                issues.append("No features were defined for this project.")
-            for feature in features:
-                if not any(item.get("feature", "").casefold() == feature.casefold() for item in requirements):
-                    issues.append(f"Feature '{feature}' is missing a requirement.")
-            for requirement in requirements:
-                req_id = requirement.get("id")
-                types = {test.get("type") for test in tests if test.get("requirement_id") == req_id}
-                for kind in ("positive", "negative"):
-                    if kind not in types:
-                        issues.append(f"Requirement {req_id} is missing a {kind} test case.")
-            if requirements:
-                complete = 0
-                for requirement in requirements:
-                    req_id = requirement.get("id")
-                    types = {test.get("type") for test in tests if test.get("requirement_id") == req_id}
-                    if {"positive", "negative"}.issubset(types):
-                        complete += 1
-                score = round((complete / len(requirements)) * 100, 1) if requirements else 0.0
-            else:
-                score = 0.0
-        elif document_type in {"PRD", "User stories"}:
-            if not document:
-                issues.append("Document content is empty.")
-            if document_type == "PRD":
-                if not document.get("requirements"):
-                    issues.append("PRD is missing explicit requirements.")
-            else:
-                if not document.get("stories"):
-                    issues.append("User stories are missing.")
-            score = 82.0
-        else:
-            if not document.get("text", ""):
-                issues.append("Document is empty.")
-            score = 78.0
-    else:
-        text = str(document or "").strip()
-        if not text:
-            issues.append("Document content is empty.")
-        if len(text.split()) < 40:
-            issues.append("Document is short and may lack detail.")
-        score = 75.0
-
-    return {
-        "document_type": document_type,
-        "score": max(0.0, min(100.0, score)),
-        "issues": issues[:8],
-        "recommendations": [
-            "Add clearer acceptance criteria.",
-            "Check for ambiguous or duplicate statements.",
-            "Ensure every requirement maps to a real feature.",
-        ],
-    }
-
-
-def build_offline_srs(project: dict) -> dict:
-    features = project.get("features") or []
-    requirements = []
-    test_cases = []
-    if not features:
-        return {
-            "document_type": "SRS",
-            "project": project.get("name") or "Untitled project",
-            "summary": "Generated offline SRS for an empty feature list.",
-            "requirements": [],
-            "test_cases": [],
-        }
-    for index, feature in enumerate(features, 1):
-        req_id = f"REQ-{index:02d}"
-        requirements.append({
-            "id": req_id,
-            "feature": feature,
-            "text": f"The system shall support {feature.lower()}.",
-        })
-        test_cases.extend([
-            {
-                "id": f"TC-{(index * 2) - 1:02d}",
-                "requirement_id": req_id,
-                "type": "positive",
-                "description": f"Valid use of '{feature}' succeeds.",
-            },
-            {
-                "id": f"TC-{(index * 2):02d}",
-                "requirement_id": req_id,
-                "type": "negative",
-                "description": f"Invalid or unsupported use of '{feature}' is rejected gracefully.",
-            },
-        ])
-    return {
-        "document_type": "SRS",
-        "project": project.get("name") or "Untitled project",
-        "summary": f"Generated offline SRS for {project.get('name') or 'Untitled project'}.",
-        "requirements": requirements,
-        "test_cases": test_cases,
-    }
-
-
-def build_offline_prd(project: dict) -> dict:
-    features = project.get("features") or []
-    return {
-        "document_type": "PRD",
-        "project": project.get("name") or "Untitled project",
-        "goal": project.get("idea") or "Project goal not provided.",
-        "problem_statement": f"Users need a clear and reliable way to work with {project.get('name') or 'this project'}.",
-        "user_personas": ["Registered user", "Community member", "Job seeker"],
-        "requirements": [
-            {"id": f"PRD-{idx:02d}", "requirement": f"The system shall support {feature.lower()}"}
-            for idx, feature in enumerate(features, 1)
-        ] or [{"id": "PRD-01", "requirement": "The product shall define its core requirements clearly."}],
-        "success_metrics": [
-            "Users complete onboarding quickly.",
-            "Core documentation and actions are easy to understand.",
-        ],
-    }
-
-
-def build_offline_user_stories(project: dict) -> dict:
-    features = project.get("features") or []
-    stories = []
-    if features:
-        for index, feature in enumerate(features, 1):
-            stories.append(
-                {
-                    "id": f"US-{index:02d}",
-                    "as_a": "User",
-                    "i_want": feature.lower(),
-                    "so_that": "I can complete a meaningful outcome for the product.",
-                    "acceptance_criteria": [
-                        f"The user can access the {feature.lower()} flow.",
-                        f"The system rejects invalid input during the {feature.lower()} flow.",
-                    ],
-                }
-            )
-    return {
-        "document_type": "User stories",
-        "project": project.get("name") or "Untitled project",
-        "stories": stories or [{
-            "id": "US-01",
-            "as_a": "User",
-            "i_want": "to understand the product goals",
-            "so_that": "I can contribute to the project.",
-            "acceptance_criteria": [
-                "The goal is clearly described.",
-                "The user can understand the expected behavior."
-            ],
-        }],
-    }
-
-
-def improve_document_offline(text: str, mode: str) -> str:
-    raw = (text or "").strip()
-    if not raw:
-        return "# Improved document\n\nNo source content was provided. Add text and try again."
-
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    intro = "# Improved document\n\n## Overview\nThis document has been cleaned up, clarified, and rewritten for readability and consistency.\n"
-
-    if mode == "Improve clarity":
-        body = "\n\n".join(f"### Section {idx}\n{line}" for idx, line in enumerate(lines[:8], 1))
-    elif mode == "Add acceptance criteria":
-        body = "\n\n".join([
-            "## Acceptance criteria",
-            "- The system shall state the required behavior clearly.",
-            "- The outcome shall be observable and testable.",
-            "- Edge cases shall be handled without ambiguity.",
-            *[f"- {line}" for line in lines[:6]],
-        ])
-    elif mode == "Formal specification":
-        body = "\n\n".join([
-            "## Formal specification",
-            "The system shall provide a clear and unambiguous description of scope, constraints, and expected behavior.",
-            "The specification shall be internally consistent and testable.",
-            *[f"- {line}" for line in lines[:6]],
-        ])
-    elif mode == "Simplify":
-        body = "\n\n".join(["## Simplified summary", *[f"- {line}" for line in lines[:10]]])
-    else:
-        body = "\n\n".join(["## Refined draft", *[f"- {line}" for line in lines[:10]]])
-
-    return intro + body + "\n\n## Notes\n- Ambiguous wording was reduced.\n- Repeated or unclear statements were reorganized.\n- Acceptance criteria were added for testability.\n"
-
-
-def build_prompt_for_document(project: dict, document_type: str, source_text: str) -> str:
-    return (
-        f"You are a senior technical writer for software documentation.\n"
-        f"Project: {project['name']}\n"
-        f"Project idea: {project['idea']}\n"
-        f"Document type: {document_type}\n\n"
-        f"Use this source material where helpful:\n{source_text}\n\n"
-        "Return a polished document in valid Markdown with clear headings and effective structure. "
-        "Keep it concise but complete."
-    )
-
-
-def render_document_output(document: dict | str, document_type: str) -> None:
-    if isinstance(document, dict):
-        if "text" in document:
-            st.subheader("Improved document")
-            st.markdown(document["text"])
-        elif document_type == "SRS":
-            st.subheader("Generated SRS")
-            st.json(document)
-        elif document_type == "PRD":
-            st.subheader("Generated PRD")
-            st.json(document)
-        elif document_type == "User stories":
-            st.subheader("User stories")
-            st.json(document)
-        else:
-            st.subheader("Generated document")
-            st.json(document)
-    else:
-        st.subheader("Improved document")
-        st.markdown(document)
+        key = "requirements" if document.get("document_type") == "PRD" else "stories"
+        score, issues = (82, []) if document.get(key) else (0, [f"{key.title()} are missing."])
+    return {"score": score, "issues": issues, "recommendations": ["Add clear acceptance criteria.", "Remove ambiguous or duplicate statements."]}
 
 
 def app() -> None:
     st.set_page_config(page_title="DocuMind AI", page_icon="📚", layout="wide")
-    st.markdown(
-        """
-        <style>
-        .block-container {max-width: 1200px; padding-top: 2rem;}
-        .hero {padding: 1.5rem 1.8rem; border-radius: 18px; background: linear-gradient(120deg,#172554,#2563eb); color: white; margin-bottom: 1rem;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        '<div class="hero"><h1>📚 DocuMind AI</h1><p>Iterative documentation assistant for software projects</p></div>',
-        unsafe_allow_html=True,
-    )
-
-    ensure_session_state()
+    st.title("📚 DocuMind AI")
+    st.caption("Automatically generate and improve documentation from your project description, pasted draft, or uploaded notes.")
+    st.session_state.setdefault("versions", [])
+    st.session_state.setdefault("current_document", None)
 
     with st.sidebar:
         st.header("Project setup")
-
-        if st.button("Load sample project"):
-            st.session_state.project_name = SAMPLE_PROJECT["name"]
-            st.session_state.project_idea = SAMPLE_PROJECT["idea"]
-            st.session_state.features_raw = "\n".join(SAMPLE_PROJECT["features"])
-            st.session_state.source_text = SAMPLE_DOC_TEXT
-            st.rerun()
-
-        project_name = st.text_input(
-            "Project name",
-            value=st.session_state.get("project_name", ""),
-            placeholder="My amazing app",
-        )
-        st.session_state.project_name = project_name
-
-        project_idea = st.text_area(
-            "Project description",
-            value=st.session_state.get("project_idea", ""),
-            height=120,
-            placeholder="Describe what the app does and who it is for...",
-        )
-        st.session_state.project_idea = project_idea
-
-        features_raw = st.text_area(
-            "Features (one per line)",
-            value=st.session_state.get("features_raw", ""),
-            height=150,
-            placeholder="Feature 1\nFeature 2\nFeature 3",
-        )
-        st.session_state.features_raw = features_raw
-
-        document_type = st.selectbox(
-            "Document type",
-            ["SRS", "PRD", "User stories", "Improved text"],
-            index=0,
-        )
-        improvement_mode = st.selectbox(
-            "Improvement mode",
-            ["Improve clarity", "Add acceptance criteria", "Formal specification", "Simplify"],
-            index=0,
-        )
-
+        project_name = st.text_input("Project name", placeholder="My application")
+        project_idea = st.text_area("Project description", placeholder="What does the application do?", height=110)
+        features_raw = st.text_area("Features (one per line, optional)", placeholder="User login\nSearch\nReports", height=110)
+        kind = st.selectbox("Document type", ["SRS", "PRD", "User stories", "Improved text"])
         api_key = st.text_input("Gemini API key (optional)", type="password")
-        offline_mode = st.toggle("Offline mode", value=not bool(api_key or os.getenv("GEMINI_API_KEY")))
-        uploaded = st.file_uploader("Add local project knowledge (.txt)", type=["txt"], accept_multiple_files=True)
+        offline = st.toggle("Offline mode", value=not bool(api_key or os.getenv("GEMINI_API_KEY")))
+        uploaded = st.file_uploader("Upload project notes (.txt)", type=["txt"], accept_multiple_files=True)
+        auto_generate = st.checkbox("Automatically generate when notes are uploaded", value=True)
 
-    project = {
-        "name": project_name.strip() or "Untitled project",
-        "idea": project_idea.strip() or "No project description yet.",
-        "features": [line.strip() for line in features_raw.splitlines() if line.strip()],
-    }
+    uploaded_text = [(f.name, f.getvalue().decode("utf-8", errors="ignore")) for f in (uploaded or [])]
+    uploaded_source = "\n\n".join(f"# {name}\n{text}" for name, text in uploaded_text)
+    source = st.text_area("Document draft / source text", value=uploaded_source, height=250, placeholder="Paste a draft here, or upload .txt notes above.")
+    source = source.strip() or uploaded_source.strip()
 
-    uploaded_text = [(file.name, file.getvalue().decode("utf-8", errors="ignore")) for file in (uploaded or [])]
+    explicit_features = [x.strip() for x in features_raw.splitlines() if x.strip()]
+    detected_features = features_from_text(source)
+    features = explicit_features or detected_features
+    project = {"name": project_name.strip(), "idea": project_idea.strip(), "features": features}
+
+    if uploaded_source:
+        st.success(f"Loaded {len(uploaded_text)} note file(s). The uploaded content is now the source document.")
+        if not explicit_features and detected_features:
+            st.info(f"Automatically detected {len(detected_features)} feature/section candidate(s) from the uploaded notes.")
+
     chunks = load_text_files("data", uploaded_text)
-    st.info(f"Knowledge base: {len(chunks)} text chunk(s) loaded locally.")
-
-    query = f"{project_name} {project_idea} {' '.join(project['features'])}".strip()
-    matches = retrieve(query, chunks) if query else []
-    with st.expander("View retrieved evidence"):
+    query = " ".join(x for x in [project_name, project_idea, " ".join(features)] if x)
+    with st.expander("Retrieved project evidence"):
+        matches = retrieve(query, chunks) if query else []
         if matches:
             for chunk, score in matches:
                 st.markdown(f"**{chunk.source}** · relevance `{score:.2f}`")
                 st.write(chunk.text)
         else:
-            st.write("No matching evidence yet. Add notes in the `data` folder or upload `.txt` files.")
+            st.write("Upload notes or add files to the data folder to retrieve evidence.")
 
-    source_text = st.text_area(
-        "Document draft / source text",
-        value=st.session_state.get("source_text", ""),
-        height=260,
-        help="Paste your rough document here or upload a text file. You can improve it iteratively.",
-    )
-    st.session_state.source_text = source_text
-
-    if not project_name.strip() and not project_idea.strip() and not features_raw.strip() and not source_text.strip():
-        st.info("Start by entering your own project details or click 'Load sample project' for a quick example.")
-
-    col1, col2, col3 = st.columns([1, 1, 1])
-
-    with col1:
-        if st.button("✨ Generate document"):
+    def generate() -> None:
+        if not project_name.strip() and not source:
+            st.warning("Enter a project name or upload/paste source notes first.")
+            return
+        document = offline_document(project, kind, source)
+        key = api_key or os.getenv("GEMINI_API_KEY")
+        if not offline and key:
+            prompt = f"Create a polished {kind} for project '{project['name']}'. Project description: {project['idea']}. Use only these source notes:\n{source}"
             try:
-                if not project_name.strip():
-                    st.warning("Please enter a project name before generating a document.")
-                    return
+                document = {"document_type": kind, "text": ask_gemini(prompt, api_key=key, json_response=False)}
+            except Exception as exc:
+                st.warning(f"Gemini was unavailable; used offline generation instead: {exc}")
+        st.session_state.current_document = document
+        save_version(project_name or "untitled-project", kind, document)
 
-                if document_type == "SRS":
-                    generated = build_offline_srs(project)
-                elif document_type == "PRD":
-                    generated = build_offline_prd(project)
-                elif document_type == "User stories":
-                    generated = build_offline_user_stories(project)
-                else:
-                    generated = {"document_type": "Improved text", "text": improve_document_offline(source_text, improvement_mode)}
+    uploaded_signature = "|".join(name + str(len(text)) for name, text in uploaded_text)
+    if auto_generate and uploaded_signature and uploaded_signature != st.session_state.get("last_uploaded_signature"):
+        st.session_state.last_uploaded_signature = uploaded_signature
+        generate()
 
-                if (not offline_mode) and (api_key or os.getenv("GEMINI_API_KEY")):
-                    prompt = build_prompt_for_document(project, document_type, source_text or "No source text provided.")
-                    key = api_key or os.getenv("GEMINI_API_KEY")
-                    try:
-                        ai_text = ask_gemini(prompt, api_key=key, json_response=False)
-                        generated = {"document_type": document_type, "text": ai_text}
-                    except Exception:
-                        pass
-
-                st.session_state.current_document = generated
-                save_version(project_name, document_type, generated)
-                st.success(f"{document_type} generated and saved to the workspace.")
-            except Exception as exc:  # pragma: no cover
-                st.error(str(exc))
-
-    with col2:
-        if st.button("🛠️ Improve document"):
-            try:
-                if not source_text.strip():
-                    st.warning("Paste or type some source text before improving it.")
-                    return
-                improved = improve_document_offline(source_text, improvement_mode)
-                st.session_state.current_document = {"document_type": "Improved text", "text": improved}
-                save_version(project_name or "Untitled project", "Improved text", improved)
-                st.success("Improved document generated.")
-            except Exception as exc:  # pragma: no cover
-                st.error(str(exc))
-
-    with col3:
-        if st.button("📈 Quality check"):
-            if st.session_state.current_document is not None:
-                current = st.session_state.current_document
-                report = generate_quality_report(project, current, document_type)
-                st.session_state.quality_report = report
-                st.success("Quality review generated.")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✨ Generate document", type="primary"):
+            generate()
+    with c2:
+        if st.button("🛠️ Improve current text"):
+            if source:
+                st.session_state.current_document = offline_document(project, "Improved text", source)
+                save_version(project_name or "untitled-project", "Improved text", st.session_state.current_document)
             else:
-                st.warning("Generate or improve a document first.")
+                st.warning("Paste or upload a document first.")
 
-    if st.session_state.current_document is not None:
-        current = st.session_state.current_document
-        st.subheader("Current document")
-        render_document_output(current, document_type)
-
-        if isinstance(current, dict):
-            quality = generate_quality_report(project, current, document_type)
-            st.subheader("Quality analysis")
-            st.metric("Score", f"{quality['score']:.1f}%")
-            if quality["issues"]:
-                st.warning("Issues found: " + " · ".join(quality["issues"]))
-            else:
-                st.success("No obvious structural issues detected.")
-            st.json({"issues": quality["issues"], "recommendations": quality["recommendations"]})
+    document = st.session_state.current_document
+    if document is not None:
+        st.subheader("Generated document")
+        if isinstance(document, str):
+            st.markdown(document)
+        elif "text" in document:
+            st.markdown(document["text"])
         else:
-            quality = generate_quality_report(project, current, document_type)
-            st.subheader("Quality analysis")
-            st.metric("Score", f"{quality['score']:.1f}%")
-            if quality["issues"]:
-                st.warning("Issues found: " + " · ".join(quality["issues"]))
-            else:
-                st.success("No obvious structural issues detected.")
-
-        if st.button("🔄 Compare with previous version"):
-            if len(st.session_state.versions) >= 2:
-                previous = st.session_state.versions[-2]
-                previous_path = Path(previous["path"])
-                previous_content = previous_path.read_text(encoding="utf-8")
-                current_content = json.dumps(current, indent=2) if isinstance(current, dict) else current
-                st.subheader("Version diff")
-                st.code(create_diff(previous_content, current_content))
-            else:
-                st.info("Generate at least two versions to compare them.")
+            st.json(document)
+        report = quality(document)
+        st.subheader("Quality analysis")
+        st.metric("Score", f"{report['score']:.1f}%")
+        if report["issues"]:
+            st.warning(" · ".join(report["issues"]))
+        else:
+            st.success("No obvious structural issues detected.")
+        st.json({"recommendations": report["recommendations"]})
 
     st.divider()
     st.subheader("Ask your project")
-    question = st.text_input("Question", placeholder="What should happen when an unauthorised user sends a message?")
+    question = st.text_input("Question", placeholder="What should happen when invalid data is submitted?")
     if st.button("Ask AI") and question:
-        evidence = format_context(retrieve(question, chunks)) or "No matching local evidence was found. Say that clearly."
-        try:
-            if offline_mode:
-                answer = "Offline answer based on retrieved evidence:\n\n" + evidence
-            else:
-                key = api_key or os.getenv("GEMINI_API_KEY")
-                if not key:
-                    raise RuntimeError("Set a Gemini API key or switch on Offline mode.")
-                answer = ask_gemini(
-                    f"Answer using only the evidence below. Do not invent facts.\n\nEVIDENCE:\n{evidence}\n\nQUESTION:\n{question}",
-                    api_key=key,
-                    json_response=False,
-                )
-            st.write(answer)
-        except Exception as exc:  # pragma: no cover
-            st.error(str(exc))
+        evidence = format_context(retrieve(question, chunks)) or source or "No project evidence was provided."
+        if offline:
+            st.write("Answer based on the available project evidence:\n\n" + evidence)
+        else:
+            try:
+                st.write(ask_gemini(f"Answer only from this evidence:\n{evidence}\n\nQuestion: {question}", api_key=api_key or os.getenv("GEMINI_API_KEY"), json_response=False))
+            except Exception as exc:
+                st.error(str(exc))
 
-    st.divider()
     st.subheader("Workspace versions")
-    if st.session_state.versions:
-        for index, version in enumerate(st.session_state.versions, 1):
-            st.caption(f"v{index}: {version['type']} · {version['saved_at']}")
-    else:
-        st.caption("No saved versions yet.")
+    for i, version in enumerate(st.session_state["versions"], 1):
+        st.caption(f"v{i}: {version['type']} · {version['saved_at']}")
 
 
 if __name__ == "__main__":
